@@ -1,42 +1,6 @@
-"""
-STARTER FILE — build the actual service here (or restructure into more
-files/modules if you prefer; this single-file skeleton is just a starting
-point, not a requirement).
-
-See PROBLEM.md for the full spec. Summary of what needs to exist by the end:
-
-  POST /students/{student_id}/attempts
-      Body: {"skill_id": str, "is_correct": bool}
-      - Only the student themselves may submit their own attempts.
-      - Updates that student's mastery score (0-100) for that skill using a
-        scoring approach YOU design and justify in WRITEUP.md.
-      - Calls get_ai_feedback() (see ai_feedback.py) to get a feedback
-        string for the response. That call is slow and sometimes fails —
-        your endpoint must still behave well when it does.
-      - Enforces: max 30 attempts per student per rolling 24h. A request
-        that fails validation (bad skill_id, malformed body, etc.) must NOT
-        count against that limit.
-      - If this attempt takes the student's mastery for that skill above 80
-        for the first time, a milestone notification must be durably
-        recorded — including surviving a crash between "mastery updated"
-        and "notification recorded."
-
-  GET /students/{student_id}/mastery
-      - A student may view their own mastery.
-      - A teacher may view mastery for any student on their own roster
-        (see seed_data.TEACHER_ROSTERS), and no one else's.
-      - Returns current mastery per skill for that student.
-
-  GET /notifications/{student_id}
-      - Same access rule as above. Returns the milestone notifications
-        recorded for that student.
-
-Everything below this docstring is scaffolding, not a solution — feel free
-to delete, restructure, or heavily rewrite it.
-"""
-
 import asyncio
 import sqlite3
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -44,10 +8,16 @@ from fastapi.responses import JSONResponse
 
 from mastery_service.ai_feedback import get_ai_feedback
 from mastery_service.attempts import RateLimitExceeded, record_attempt
-from mastery_service.auth import require_submit_access
+from mastery_service.auth import require_submit_access, require_view_access
 from mastery_service.db import get_db, init_db
-from mastery_service.schemas import AttemptRequest, AttemptResponse
-from mastery_service.seed_data import TOKENS
+from mastery_service.schemas import (
+    AttemptRequest,
+    AttemptResponse,
+    MasteryItem,
+    MasteryResponse,
+)
+from mastery_service.scoring import BASELINE_SEED, decay_mastery
+from mastery_service.seed_data import SKILL_IDS, TOKENS
 
 AI_TIMEOUT_SECONDS = 6
 
@@ -127,5 +97,37 @@ async def submit_attempt(
     )
 
 
-# TODO: GET /students/{student_id}/mastery
+@app.get("/students/{student_id}/mastery", response_model=MasteryResponse)
+def get_student_mastery(
+    student_id: str,
+    identity: dict = Depends(get_current_identity),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> MasteryResponse:
+    require_view_access(identity, student_id)
+
+    now = time.time()
+
+    cursor = conn.execute(
+        "SELECT skill_id, score, last_practiced_at FROM mastery WHERE student_id = ?",
+        (student_id,),
+    )
+    stored_mastery = {
+        row["skill_id"]: (float(row["score"]), float(row["last_practiced_at"]))
+        for row in cursor.fetchall()
+    }
+
+    mastery_items = []
+    for skill_id in SKILL_IDS:
+        if skill_id in stored_mastery:
+            score, last_practiced_at = stored_mastery[skill_id]
+            current_score = decay_mastery(score, last_practiced_at, now)
+        else:
+            current_score = BASELINE_SEED
+
+        mastery_items.append(MasteryItem(skill_id=skill_id, mastery=current_score))
+
+    return MasteryResponse(student_id=student_id, mastery=mastery_items)
+
+
 # TODO: GET /notifications/{student_id}
+

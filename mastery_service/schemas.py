@@ -30,7 +30,6 @@ class RateLimitError(BaseModel):
 class MasteryItem(BaseModel):
     skill_id: str
     mastery: float
-    last_practiced_at: str
 
 
 class MasteryResponse(BaseModel):

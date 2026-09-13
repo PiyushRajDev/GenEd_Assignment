@@ -24,7 +24,6 @@ def update_mastery(
     is_correct: bool,
     now: float,
 ) -> float:
-    """Calculate updated mastery score using cold-start seed or decay followed by EWMA."""
     if previous_score is not None and last_practiced_at is None:
         raise ValueError("last_practiced_at must be provided when previous_score exists")
 
