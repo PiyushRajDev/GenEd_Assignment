@@ -35,11 +35,16 @@ Everything below this docstring is scaffolding, not a solution — feel free
 to delete, restructure, or heavily rewrite it.
 """
 
+import sqlite3
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 
-from mastery_service.db import init_db
+from mastery_service.attempts import RateLimitExceeded, record_attempt
+from mastery_service.auth import require_submit_access
+from mastery_service.db import get_db, init_db
+from mastery_service.schemas import AttemptRequest, AttemptResponse
 from mastery_service.seed_data import TOKENS
 
 
@@ -50,6 +55,15 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="GenEd Mastery Service — Take-Home", lifespan=lifespan)
+
+
+@app.exception_handler(RateLimitExceeded)
+def handle_rate_limit_exceeded(request: Request, exc: RateLimitExceeded) -> JSONResponse:
+    return JSONResponse(
+        status_code=429,
+        content={"detail": exc.detail, "retry_after_seconds": exc.retry_after_seconds},
+        headers={"Retry-After": str(exc.retry_after_seconds)},
+    )
 
 
 def get_current_identity(authorization: str = Header(default="")) -> dict:
@@ -70,6 +84,30 @@ def health() -> dict:
     return {"status": "ok"}
 
 
-# TODO: POST /students/{student_id}/attempts
+@app.post("/students/{student_id}/attempts", response_model=AttemptResponse)
+def submit_attempt(
+    student_id: str,
+    attempt: AttemptRequest,
+    identity: dict = Depends(get_current_identity),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> AttemptResponse:
+    require_submit_access(identity, student_id)
+
+    result = record_attempt(
+        conn=conn,
+        student_id=student_id,
+        skill_id=attempt.skill_id,
+        is_correct=attempt.is_correct,
+    )
+
+    return AttemptResponse(
+        skill_id=result.skill_id,
+        mastery=result.mastery,
+        milestone_reached=result.milestone_reached,
+        feedback=None,
+        feedback_status="unavailable",
+    )
+
+
 # TODO: GET /students/{student_id}/mastery
 # TODO: GET /notifications/{student_id}
