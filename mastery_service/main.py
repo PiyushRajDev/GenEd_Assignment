@@ -35,17 +35,21 @@ Everything below this docstring is scaffolding, not a solution — feel free
 to delete, restructure, or heavily rewrite it.
 """
 
+import asyncio
 import sqlite3
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from mastery_service.ai_feedback import get_ai_feedback
 from mastery_service.attempts import RateLimitExceeded, record_attempt
 from mastery_service.auth import require_submit_access
 from mastery_service.db import get_db, init_db
 from mastery_service.schemas import AttemptRequest, AttemptResponse
 from mastery_service.seed_data import TOKENS
+
+AI_TIMEOUT_SECONDS = 6
 
 
 @asynccontextmanager
@@ -85,7 +89,7 @@ def health() -> dict:
 
 
 @app.post("/students/{student_id}/attempts", response_model=AttemptResponse)
-def submit_attempt(
+async def submit_attempt(
     student_id: str,
     attempt: AttemptRequest,
     identity: dict = Depends(get_current_identity),
@@ -100,12 +104,26 @@ def submit_attempt(
         is_correct=attempt.is_correct,
     )
 
+    # AI feedback is best-effort enrichment, called only after the domain
+    # transaction has committed so that AI latency/failure never blocks or
+    # rolls back the authoritative state change.
+    feedback = None
+    feedback_status = "unavailable"
+    try:
+        async with asyncio.timeout(AI_TIMEOUT_SECONDS):
+            feedback = await asyncio.to_thread(
+                get_ai_feedback, attempt.skill_id, attempt.is_correct,
+            )
+        feedback_status = "ok"
+    except Exception:
+        pass
+
     return AttemptResponse(
         skill_id=result.skill_id,
         mastery=result.mastery,
         milestone_reached=result.milestone_reached,
-        feedback=None,
-        feedback_status="unavailable",
+        feedback=feedback,
+        feedback_status=feedback_status,
     )
 
 

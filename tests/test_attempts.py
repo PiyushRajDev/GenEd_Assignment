@@ -398,7 +398,11 @@ def test_begin_immediate_writer_reservation(tmp_path):
 # -------------------------------------------------------------------------
 # 14. API Route: Valid attempt submission
 # -------------------------------------------------------------------------
-def test_api_submit_attempt_success(test_db_path):
+def test_api_submit_attempt_success(test_db_path, monkeypatch):
+    monkeypatch.setattr(
+        "mastery_service.main.get_ai_feedback",
+        lambda skill_id, is_correct: f"Great job on {skill_id}!",
+    )
     client = TestClient(app)
     resp = client.post(
         "/students/student-ananya/attempts",
@@ -410,8 +414,8 @@ def test_api_submit_attempt_success(test_db_path):
     assert data["skill_id"] == SKILL_A
     assert data["mastery"] == 60.0
     assert data["milestone_reached"] is False
-    assert data["feedback"] is None
-    assert data["feedback_status"] == "unavailable"
+    assert data["feedback"] == f"Great job on {SKILL_A}!"
+    assert data["feedback_status"] == "ok"
 
 
 # -------------------------------------------------------------------------
@@ -501,3 +505,286 @@ def test_api_rate_limit_exceeded(test_db_path):
     assert data["detail"] == "Rate limit exceeded"
     assert "retry_after_seconds" in data
     assert data["retry_after_seconds"] >= 0
+
+
+# =========================================================================
+# AI feedback tests (Commit 6)
+# =========================================================================
+
+
+# -------------------------------------------------------------------------
+# 18. AI success → feedback returned with status "ok"
+# -------------------------------------------------------------------------
+def test_ai_success(test_db_path, monkeypatch):
+    monkeypatch.setattr(
+        "mastery_service.main.get_ai_feedback",
+        lambda skill_id, is_correct: f"Great job on {skill_id}!",
+    )
+    client = TestClient(app)
+    resp = client.post(
+        "/students/student-ananya/attempts",
+        headers={"Authorization": "Bearer token-student-ananya"},
+        json={"skill_id": SKILL_A, "is_correct": True},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["feedback"] == f"Great job on {SKILL_A}!"
+    assert data["feedback_status"] == "ok"
+    assert data["mastery"] == 60.0
+    assert data["milestone_reached"] is False
+
+    # Verify persistence
+    conn = get_connection(test_db_path)
+    assert conn.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 1
+    assert conn.execute("SELECT score FROM mastery WHERE student_id = 'student-ananya'").fetchone()[0] == 60.0
+    conn.close()
+
+
+# -------------------------------------------------------------------------
+# 19. AI provider exception → attempt persisted, feedback unavailable
+# -------------------------------------------------------------------------
+def test_ai_exception_still_succeeds(test_db_path, monkeypatch):
+    def failing_provider(skill_id, is_correct):
+        raise RuntimeError("AI provider exploded")
+
+    monkeypatch.setattr("mastery_service.main.get_ai_feedback", failing_provider)
+    client = TestClient(app)
+    resp = client.post(
+        "/students/student-ananya/attempts",
+        headers={"Authorization": "Bearer token-student-ananya"},
+        json={"skill_id": SKILL_A, "is_correct": True},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["feedback"] is None
+    assert data["feedback_status"] == "unavailable"
+    assert data["mastery"] == 60.0
+
+    conn = get_connection(test_db_path)
+    assert conn.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 1
+    assert conn.execute("SELECT score FROM mastery WHERE student_id = 'student-ananya'").fetchone()[0] == 60.0
+    conn.close()
+
+
+# -------------------------------------------------------------------------
+# 20. AI timeout → attempt persisted, feedback unavailable
+# -------------------------------------------------------------------------
+def test_ai_timeout_still_succeeds(test_db_path, monkeypatch):
+    import threading
+
+    def slow_provider(skill_id, is_correct):
+        # Block long enough to exceed the 6-second timeout, but use an event
+        # so the thread can be interrupted quickly when the timeout fires.
+        threading.Event().wait(timeout=1)
+        return "should never arrive"
+
+    monkeypatch.setattr("mastery_service.main.get_ai_feedback", slow_provider)
+    # Shorten the timeout so the test doesn't actually wait 6 seconds
+    monkeypatch.setattr("mastery_service.main.AI_TIMEOUT_SECONDS", 0.1)
+
+    client = TestClient(app)
+    resp = client.post(
+        "/students/student-ananya/attempts",
+        headers={"Authorization": "Bearer token-student-ananya"},
+        json={"skill_id": SKILL_A, "is_correct": True},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["feedback"] is None
+    assert data["feedback_status"] == "unavailable"
+
+    conn = get_connection(test_db_path)
+    assert conn.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 1
+    conn.close()
+
+
+# -------------------------------------------------------------------------
+# 21. AI is called only after successful persistence
+# -------------------------------------------------------------------------
+def test_ai_called_after_persistence(test_db_path, monkeypatch):
+    call_log = []
+
+    def inspecting_provider(skill_id, is_correct):
+        # At the moment the AI provider is invoked, verify the attempt is
+        # already committed to the database.
+        conn = get_connection(test_db_path)
+        count = conn.execute("SELECT COUNT(*) FROM attempts WHERE student_id = 'student-ananya'").fetchone()[0]
+        conn.close()
+        call_log.append({"count_at_call_time": count})
+        return "feedback"
+
+    monkeypatch.setattr("mastery_service.main.get_ai_feedback", inspecting_provider)
+    client = TestClient(app)
+    resp = client.post(
+        "/students/student-ananya/attempts",
+        headers={"Authorization": "Bearer token-student-ananya"},
+        json={"skill_id": SKILL_A, "is_correct": True},
+    )
+    assert resp.status_code == 200
+    assert len(call_log) == 1
+    assert call_log[0]["count_at_call_time"] == 1
+
+
+# -------------------------------------------------------------------------
+# 22. Rate-limit rejection does not call AI
+# -------------------------------------------------------------------------
+def test_rate_limited_does_not_call_ai(test_db_path, monkeypatch):
+    call_count = {"n": 0}
+
+    def counting_provider(skill_id, is_correct):
+        call_count["n"] += 1
+        return "feedback"
+
+    monkeypatch.setattr("mastery_service.main.get_ai_feedback", counting_provider)
+
+    conn = get_connection(test_db_path)
+    now = time.time()
+    for i in range(30):
+        conn.execute(
+            "INSERT INTO attempts (student_id, skill_id, is_correct, created_at) VALUES (?, ?, ?, ?)",
+            ("student-ananya", SKILL_A, 1, now - (i * 10)),
+        )
+    conn.close()
+
+    client = TestClient(app)
+    resp = client.post(
+        "/students/student-ananya/attempts",
+        headers={"Authorization": "Bearer token-student-ananya"},
+        json={"skill_id": SKILL_A, "is_correct": True},
+    )
+    assert resp.status_code == 429
+    assert call_count["n"] == 0
+
+
+# -------------------------------------------------------------------------
+# 23. Invalid request does not call AI
+# -------------------------------------------------------------------------
+def test_invalid_request_does_not_call_ai(test_db_path, monkeypatch):
+    call_count = {"n": 0}
+
+    def counting_provider(skill_id, is_correct):
+        call_count["n"] += 1
+        return "feedback"
+
+    monkeypatch.setattr("mastery_service.main.get_ai_feedback", counting_provider)
+
+    client = TestClient(app)
+    resp = client.post(
+        "/students/student-ananya/attempts",
+        headers={"Authorization": "Bearer token-student-ananya"},
+        json={"skill_id": "nonexistent-skill", "is_correct": True},
+    )
+    assert resp.status_code == 422
+    assert call_count["n"] == 0
+
+
+# -------------------------------------------------------------------------
+# 24. Unauthorized submission does not call AI
+# -------------------------------------------------------------------------
+def test_unauthorized_does_not_call_ai(test_db_path, monkeypatch):
+    call_count = {"n": 0}
+
+    def counting_provider(skill_id, is_correct):
+        call_count["n"] += 1
+        return "feedback"
+
+    monkeypatch.setattr("mastery_service.main.get_ai_feedback", counting_provider)
+
+    client = TestClient(app)
+    # Another student trying to submit for ananya
+    resp = client.post(
+        "/students/student-ananya/attempts",
+        headers={"Authorization": "Bearer token-student-rohan"},
+        json={"skill_id": SKILL_A, "is_correct": True},
+    )
+    assert resp.status_code == 404
+    assert call_count["n"] == 0
+
+
+# -------------------------------------------------------------------------
+# 25. Domain/database failure does not call AI
+# -------------------------------------------------------------------------
+def test_domain_failure_does_not_call_ai(test_db_path, monkeypatch):
+    call_count = {"n": 0}
+
+    def counting_provider(skill_id, is_correct):
+        call_count["n"] += 1
+        return "feedback"
+
+    monkeypatch.setattr("mastery_service.main.get_ai_feedback", counting_provider)
+
+    def exploding_record(*args, **kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr("mastery_service.main.record_attempt", exploding_record)
+
+    client = TestClient(app, raise_server_exceptions=False)
+    resp = client.post(
+        "/students/student-ananya/attempts",
+        headers={"Authorization": "Bearer token-student-ananya"},
+        json={"skill_id": SKILL_A, "is_correct": True},
+    )
+    assert resp.status_code == 500
+    assert call_count["n"] == 0
+
+
+# -------------------------------------------------------------------------
+# 26. AI does not affect milestone durability
+# -------------------------------------------------------------------------
+def test_milestone_durable_despite_ai_failure(test_db_path, monkeypatch):
+    def failing_provider(skill_id, is_correct):
+        raise RuntimeError("AI down")
+
+    monkeypatch.setattr("mastery_service.main.get_ai_feedback", failing_provider)
+
+    # Seed mastery at 78.0 to trigger milestone crossing
+    conn = get_connection(test_db_path)
+    conn.execute(
+        "INSERT INTO mastery (student_id, skill_id, score, last_practiced_at) VALUES (?, ?, ?, ?)",
+        ("student-ananya", SKILL_A, 78.0, time.time()),
+    )
+    conn.close()
+
+    client = TestClient(app)
+    resp = client.post(
+        "/students/student-ananya/attempts",
+        headers={"Authorization": "Bearer token-student-ananya"},
+        json={"skill_id": SKILL_A, "is_correct": True},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["milestone_reached"] is True
+    assert data["feedback"] is None
+    assert data["feedback_status"] == "unavailable"
+
+    # Milestone notification is durable
+    conn = get_connection(test_db_path)
+    notifs = conn.execute(
+        "SELECT COUNT(*) FROM notifications WHERE student_id = 'student-ananya' AND skill_id = ?",
+        (SKILL_A,),
+    ).fetchone()[0]
+    conn.close()
+    assert notifs == 1
+
+
+# -------------------------------------------------------------------------
+# 27. No retry — exactly one AI invocation on failure
+# -------------------------------------------------------------------------
+def test_no_retry_on_ai_failure(test_db_path, monkeypatch):
+    call_count = {"n": 0}
+
+    def failing_provider(skill_id, is_correct):
+        call_count["n"] += 1
+        raise RuntimeError("transient failure")
+
+    monkeypatch.setattr("mastery_service.main.get_ai_feedback", failing_provider)
+
+    client = TestClient(app)
+    resp = client.post(
+        "/students/student-ananya/attempts",
+        headers={"Authorization": "Bearer token-student-ananya"},
+        json={"skill_id": SKILL_A, "is_correct": True},
+    )
+    assert resp.status_code == 200
+    assert call_count["n"] == 1
+
