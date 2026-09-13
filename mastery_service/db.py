@@ -38,13 +38,7 @@ CREATE TABLE IF NOT EXISTS notifications (
 
 
 def get_connection(db_path: str | None = None) -> sqlite3.Connection:
-    """Open a sqlite3 connection with isolation_level=None (manual transaction control).
-
-    Executes required PRAGMAs in order:
-      PRAGMA journal_mode=WAL;
-      PRAGMA synchronous=NORMAL;
-      PRAGMA busy_timeout=5000;
-    """
+   
     path = _resolve_db_path(db_path)
     conn = sqlite3.connect(path, isolation_level=None)
     conn.row_factory = sqlite3.Row
@@ -55,7 +49,7 @@ def get_connection(db_path: str | None = None) -> sqlite3.Connection:
 
 
 def init_db(db_path: str | None = None) -> None:
-    """Initialize database tables and indexes if they do not exist."""
+    
     conn = get_connection(db_path)
     try:
         conn.executescript(SCHEMA_SQL)
@@ -64,7 +58,7 @@ def init_db(db_path: str | None = None) -> None:
 
 
 def get_db() -> Generator[sqlite3.Connection, None, None]:
-    """FastAPI dependency yielding a sqlite3 connection per request, closing it afterward."""
+    
     conn = get_connection()
     try:
         yield conn
