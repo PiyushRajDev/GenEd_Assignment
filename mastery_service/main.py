@@ -35,11 +35,21 @@ Everything below this docstring is scaffolding, not a solution — feel free
 to delete, restructure, or heavily rewrite it.
 """
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Header, HTTPException
 
+from mastery_service.db import init_db
 from mastery_service.seed_data import TOKENS
 
-app = FastAPI(title="GenEd Mastery Service — Take-Home")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    yield
+
+
+app = FastAPI(title="GenEd Mastery Service — Take-Home", lifespan=lifespan)
 
 
 def get_current_identity(authorization: str = Header(default="")) -> dict:
