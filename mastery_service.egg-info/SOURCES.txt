@@ -1,0 +1,12 @@
+README.md
+pyproject.toml
+mastery_service/__init__.py
+mastery_service/ai_feedback.py
+mastery_service/main.py
+mastery_service/seed_data.py
+mastery_service.egg-info/PKG-INFO
+mastery_service.egg-info/SOURCES.txt
+mastery_service.egg-info/dependency_links.txt
+mastery_service.egg-info/requires.txt
+mastery_service.egg-info/top_level.txt
+tests/test_starter.py

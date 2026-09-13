@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: mastery-service
+Version: 0.1.0
+Summary: GenEd take-home project starter — Skill Mastery Tracker
+Requires-Python: >=3.11
+Requires-Dist: fastapi>=0.110
+Requires-Dist: uvicorn[standard]>=0.29
+Requires-Dist: sqlalchemy>=2.0
+Requires-Dist: pydantic>=2.6
+Requires-Dist: pytest>=8.0
+Requires-Dist: httpx>=0.27
