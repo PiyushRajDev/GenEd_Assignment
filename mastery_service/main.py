@@ -15,6 +15,8 @@ from mastery_service.schemas import (
     AttemptResponse,
     MasteryItem,
     MasteryResponse,
+    NotificationItem,
+    NotificationResponse,
 )
 from mastery_service.scoring import BASELINE_SEED, decay_mastery
 from mastery_service.seed_data import SKILL_IDS, TOKENS
@@ -129,5 +131,30 @@ def get_student_mastery(
     return MasteryResponse(student_id=student_id, mastery=mastery_items)
 
 
-# TODO: GET /notifications/{student_id}
+@app.get("/notifications/{student_id}", response_model=NotificationResponse)
+def get_student_notifications(
+    student_id: str,
+    identity: dict = Depends(get_current_identity),
+    conn: sqlite3.Connection = Depends(get_db),
+) -> NotificationResponse:
+    require_view_access(identity, student_id)
+
+    cursor = conn.execute(
+        """
+        SELECT skill_id, reached_at
+        FROM notifications
+        WHERE student_id = ?
+        ORDER BY reached_at ASC, id ASC
+        """,
+        (student_id,),
+    )
+    items = [
+        NotificationItem(
+            skill_id=row["skill_id"],
+            reached_at=str(row["reached_at"]),
+        )
+        for row in cursor.fetchall()
+    ]
+
+    return NotificationResponse(student_id=student_id, milestones=items)
 
