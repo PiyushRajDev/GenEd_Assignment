@@ -21,11 +21,23 @@ class RateLimitExceeded(Exception):
         super().__init__(detail)
 
 
+class IdempotencyConflict(Exception):
+    """Raised when an idempotency key is already used with different attempt parameters."""
+
+    def __init__(
+        self,
+        detail: str = "Idempotency key already used with different attempt parameters",
+    ) -> None:
+        self.detail = detail
+        super().__init__(detail)
+
+
 @dataclass(frozen=True)
 class AttemptResult:
     skill_id: str
     mastery: float
     milestone_reached: bool
+    is_replayed: bool = False
 
 
 def record_attempt(
@@ -34,15 +46,43 @@ def record_attempt(
     skill_id: str,
     is_correct: bool,
     now: float | None = None,
+    idempotency_key: str | None = None,
 ) -> AttemptResult:
     
     if now is None:
         now = time.time()
 
     # BEGIN IMMEDIATE holds the SQLite write reservation across the check-and-write sequence,
-    # preventing another writer from bypassing the rate-limit check.
+    # preventing another writer from bypassing the rate-limit check or concurrent idempotency check.
     conn.execute("BEGIN IMMEDIATE")
     try:
+        if idempotency_key is not None:
+            cur_key = conn.execute(
+                """
+                SELECT skill_id, is_correct, mastery, milestone_reached
+                FROM idempotency_keys
+                WHERE student_id = ? AND idempotency_key = ?
+                """,
+                (student_id, idempotency_key),
+            )
+            existing = cur_key.fetchone()
+            if existing is not None:
+                stored_skill_id = existing["skill_id"]
+                stored_is_correct = bool(existing["is_correct"])
+                if stored_skill_id == skill_id and stored_is_correct == is_correct:
+                    conn.execute("COMMIT")
+                    return AttemptResult(
+                        skill_id=stored_skill_id,
+                        mastery=float(existing["mastery"]),
+                        milestone_reached=bool(existing["milestone_reached"]),
+                        is_replayed=True,
+                    )
+                else:
+                    conn.execute("COMMIT")
+                    raise IdempotencyConflict(
+                        detail="Idempotency key already used with different attempt parameters"
+                    )
+
         attempts_in_window = count_attempts_in_window(conn, student_id, now)
         if attempts_in_window >= MAX_ATTEMPTS_PER_WINDOW:
             retry_after = compute_retry_after(conn, student_id, now)
@@ -113,6 +153,26 @@ def record_attempt(
                     (student_id, skill_id, now),
                 )
                 milestone_reached = True
+
+        if idempotency_key is not None:
+            conn.execute(
+                """
+                INSERT INTO idempotency_keys (
+                    student_id, idempotency_key, skill_id, is_correct,
+                    mastery, milestone_reached, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    student_id,
+                    idempotency_key,
+                    skill_id,
+                    1 if is_correct else 0,
+                    new_score,
+                    1 if milestone_reached else 0,
+                    now,
+                ),
+            )
 
         conn.execute("COMMIT")
         return AttemptResult(

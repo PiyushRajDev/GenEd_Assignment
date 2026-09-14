@@ -50,20 +50,28 @@ AI failure never rolls back or blocks the authoritative state change. The studen
 
 **Step-by-step scenario:** Student's mastery crosses 80 for a skill, but the process crashes before the milestone notification is recorded.
 
-This *cannot happen* in my design because the attempt insertion, mastery update, and notification insertion all occur inside a **single SQLite transaction** using `BEGIN IMMEDIATE`:
+This *cannot happen* in my design because the attempt insertion, mastery update, notification insertion, and idempotency key recording all occur inside a **single SQLite transaction** using `BEGIN IMMEDIATE`:
 
 ```
 BEGIN IMMEDIATE
+  → if idempotency_key given: check idempotency_keys
+      → if existing matches: COMMIT and return stored result (replay)
+      → if existing conflicts: COMMIT and raise 409 Conflict
+  → rate limit check
   → INSERT INTO attempts (...)
   → INSERT/UPDATE mastery (...)
   → check: was previous_score ≤ 80 AND new_score > 80 AND no existing notification?
   → INSERT INTO notifications (...)
+  → if idempotency_key given: INSERT INTO idempotency_keys (...)
 COMMIT
 ```
 
-If the process crashes at any point *before* `COMMIT`, SQLite's WAL journal guarantees that on recovery, all three writes are rolled back atomically. The student's attempt, mastery update, and notification are **all-or-nothing**. You never get a mastery update to 82 without the corresponding notification row, and you never get a notification without the attempt being recorded.
+If the process crashes at any point *before* `COMMIT`, SQLite's WAL journal guarantees that on recovery, all writes are rolled back atomically. The student's attempt, mastery update, notification, and idempotency record are **all-or-nothing**. You never get a mastery update to 82 without the corresponding notification row, and you never get a notification without the attempt being recorded.
 
-If the process crashes *after* `COMMIT` but before the HTTP response reaches the client, the data is durable on disk (SQLite `PRAGMA synchronous=NORMAL` with WAL mode ensures the commit is fsynced). The student would need to retry, but since their mastery is already updated, a duplicate attempt would just produce another EWMA step. It wouldn't re-trigger the milestone because the `notifications` table already has the `UNIQUE(student_id, skill_id)` row.
+If the process crashes *after* `COMMIT` but before the HTTP response reaches the client, the data is durable on disk (SQLite `PRAGMA synchronous=NORMAL` with WAL mode ensures the commit is fsynced). Because client retries can send an `Idempotency-Key` header:
+- On retry with matching `(skill_id, is_correct)`, the endpoint detects the existing `(student_id, idempotency_key)` row, bypasses the rate limiter, does not insert a duplicate attempt or recompute mastery, and returns the original stored result (`mastery`, `milestone_reached`). Replays explicitly skip AI feedback (`feedback = null`, `feedback_status = "unavailable"`).
+- If the client retries with conflicting parameters for the same key, it receives a 409 Conflict without modifying any data.
+- If no `Idempotency-Key` header was provided, a retry still wouldn't re-trigger the milestone because the `notifications` table has a `UNIQUE(student_id, skill_id)` constraint, though it would apply another EWMA step.
 
 **What I'd still worry about:**
 
@@ -88,6 +96,7 @@ The window uses a half-open interval `(now - 86400, now]`. An attempt timestampe
 - **Attempt #30:** Succeeds. The count query returns 29 (from the 29 existing attempts), which is `< 30`, so the 30th attempt is inserted. After this, there are 30 attempts in the window.
 - **Attempt #31:** The count query returns 30, which is `≥ MAX_ATTEMPTS_PER_WINDOW`. The system computes `retry_after` by finding the oldest attempt in the window and calculating `ceil((oldest_created_at + 86400) - now)` (how many seconds until that oldest attempt expires from the window and frees a slot). A `RateLimitExceeded` exception is raised, which the FastAPI exception handler translates to a **429 response** with a `Retry-After` header and a JSON body containing `retry_after_seconds`. The rejected attempt is **not persisted** (the transaction rolls back), so it doesn't consume a rate-limit slot.
 - **A request that fails validation (e.g. invalid `skill_id`, malformed body):** FastAPI's Pydantic validation rejects it with a 422 *before* the endpoint function even runs. No `record_attempt` call is made, so no attempt row is written and no rate-limit capacity is consumed. Similarly, authentication failures (401) and authorization failures (404) happen before the domain logic, so they don't touch the rate-limit window either.
+- **Idempotent replay requests:** When an attempt request arrives with an already-recorded `Idempotency-Key` and matching parameters, the domain transaction commits and returns immediately upon finding the key in `idempotency_keys`. It never queries or increments the rolling rate-limit window. A student can replay an existing attempt indefinitely without burning any of their 30-attempt quota.
 
 The rate limit is **per-student, cross-skill**. It counts all attempts by a student regardless of which skill they're practicing.
 

@@ -34,6 +34,18 @@ CREATE TABLE IF NOT EXISTS notifications (
     reached_at  REAL NOT NULL,
     UNIQUE (student_id, skill_id)
 );
+
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+    id                INTEGER PRIMARY KEY,
+    student_id        TEXT NOT NULL,
+    idempotency_key   TEXT NOT NULL,
+    skill_id          TEXT NOT NULL,
+    is_correct        INTEGER NOT NULL,
+    mastery           REAL NOT NULL,
+    milestone_reached INTEGER NOT NULL,
+    created_at        REAL NOT NULL,
+    UNIQUE (student_id, idempotency_key)
+);
 """
 
 

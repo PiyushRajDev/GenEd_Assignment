@@ -7,7 +7,11 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from mastery_service.ai_feedback import get_ai_feedback
-from mastery_service.attempts import RateLimitExceeded, record_attempt
+from mastery_service.attempts import (
+    IdempotencyConflict,
+    RateLimitExceeded,
+    record_attempt,
+)
 from mastery_service.auth import require_submit_access, require_view_access
 from mastery_service.db import get_db, init_db
 from mastery_service.schemas import (
@@ -42,6 +46,14 @@ def handle_rate_limit_exceeded(request: Request, exc: RateLimitExceeded) -> JSON
     )
 
 
+@app.exception_handler(IdempotencyConflict)
+def handle_idempotency_conflict(request: Request, exc: IdempotencyConflict) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={"detail": exc.detail},
+    )
+
+
 def get_current_identity(authorization: str = Header(default="")) -> dict:
     
     token = authorization.removeprefix("Bearer ").strip()
@@ -60,6 +72,7 @@ def health() -> dict:
 async def submit_attempt(
     student_id: str,
     attempt: AttemptRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     identity: dict = Depends(get_current_identity),
     conn: sqlite3.Connection = Depends(get_db),
 ) -> AttemptResponse:
@@ -70,21 +83,23 @@ async def submit_attempt(
         student_id=student_id,
         skill_id=attempt.skill_id,
         is_correct=attempt.is_correct,
+        idempotency_key=idempotency_key,
     )
 
     # AI feedback is best-effort enrichment, called only after the domain
     # transaction has committed so that AI latency/failure never blocks or
-    # rolls back the authoritative state change.
+    # rolls back the authoritative state change. Replays do not re-call AI feedback.
     feedback = None
     feedback_status = "unavailable"
-    try:
-        async with asyncio.timeout(AI_TIMEOUT_SECONDS):
-            feedback = await asyncio.to_thread(
-                get_ai_feedback, attempt.skill_id, attempt.is_correct,
-            )
-        feedback_status = "ok"
-    except Exception:
-        pass
+    if not result.is_replayed:
+        try:
+            async with asyncio.timeout(AI_TIMEOUT_SECONDS):
+                feedback = await asyncio.to_thread(
+                    get_ai_feedback, attempt.skill_id, attempt.is_correct,
+                )
+            feedback_status = "ok"
+        except Exception:
+            pass
 
     return AttemptResponse(
         skill_id=result.skill_id,
