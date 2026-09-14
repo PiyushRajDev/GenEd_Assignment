@@ -43,11 +43,7 @@ def handle_rate_limit_exceeded(request: Request, exc: RateLimitExceeded) -> JSON
 
 
 def get_current_identity(authorization: str = Header(default="")) -> dict:
-    """Resolve the Authorization header into {"role", "user_id"}.
-
-    This is deliberately trivial — see seed_data.py for how the token map
-    works. Raise HTTPException(401) for a missing/unknown token.
-    """
+    
     token = authorization.removeprefix("Bearer ").strip()
     identity = TOKENS.get(token)
     if identity is None:
