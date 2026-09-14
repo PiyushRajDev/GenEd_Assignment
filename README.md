@@ -1,8 +1,5 @@
 # GenEd Take-Home — Starter
 
-The actual assignment is in `PROBLEM.md` (sent alongside this repo) — read
-that first. This README is just setup instructions.
-
 ## Setup
 
 ```bash
@@ -25,18 +22,36 @@ Then visit http://127.0.0.1:8000/docs for the interactive API explorer.
 pytest
 ```
 
-## What's given vs. what you build
+## Docker
 
-- `mastery_service/ai_feedback.py` — given, do not rewrite. Simulates a
-  slow/flaky AI provider on purpose.
-- `mastery_service/seed_data.py` — given. Fake auth tokens, student/teacher
-  roster, skill IDs.
-- `mastery_service/main.py` — starter skeleton with the routes stubbed as
-  TODOs. Everything else (data model, storage, mastery logic, rate
-  limiting, notification durability) is yours to design and build. Feel
-  free to restructure into more files.
-- Storage: SQLite (or even in-memory, if you clearly document that
-  trade-off) is fine — no need to stand up Postgres/Redis for this.
+### Build
 
-Submit your solution plus a `WRITEUP.md` per the instructions in
-`PROBLEM.md`.
+```bash
+docker build -f .dockerfile -t gened-mastery .
+```
+
+### Run
+
+The container stores the SQLite database at `/app/data/mastery.db` (set via
+`MASTERY_DB_PATH`). Mount a named volume so the data survives container
+restarts:
+
+```bash
+docker run --rm -p 8000:8000 -v gened-data:/app/data gened-mastery
+```
+
+Then visit http://localhost:8000/docs for the interactive API explorer.
+
+To override the database path (e.g. for a custom mount):
+
+```bash
+docker run --rm -p 8000:8000 \
+  -e MASTERY_DB_PATH=/app/data/custom.db \
+  -v gened-data:/app/data \
+  gened-mastery
+```
+
+> **Note:** Data is persisted in the `gened-data` Docker volume. To start
+> fresh, remove it with `docker volume rm gened-data`.
+
+
