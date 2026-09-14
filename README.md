@@ -27,7 +27,7 @@ pytest
 ### Build
 
 ```bash
-docker build -f .dockerfile -t gened-mastery .
+docker build -t gened-mastery .
 ```
 
 ### Run
