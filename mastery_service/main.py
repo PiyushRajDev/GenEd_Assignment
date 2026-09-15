@@ -1,5 +1,7 @@
 import asyncio
+import concurrent.futures
 import sqlite3
+import threading
 import time
 from contextlib import asynccontextmanager
 
@@ -8,12 +10,13 @@ from fastapi.responses import JSONResponse
 
 from mastery_service.ai_feedback import get_ai_feedback
 from mastery_service.attempts import (
+    AttemptResult,
     IdempotencyConflict,
     RateLimitExceeded,
     record_attempt,
 )
 from mastery_service.auth import require_submit_access, require_view_access
-from mastery_service.db import get_db, init_db
+from mastery_service.db import get_connection, get_db, init_db
 from mastery_service.schemas import (
     AttemptRequest,
     AttemptResponse,
@@ -25,13 +28,80 @@ from mastery_service.schemas import (
 from mastery_service.scoring import BASELINE_SEED, decay_mastery
 from mastery_service.seed_data import SKILL_IDS, TOKENS
 
+AI_MAX_WORKERS = 16
 AI_TIMEOUT_SECONDS = 6
+
+ai_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=AI_MAX_WORKERS,
+    thread_name_prefix="ai-feedback",
+)
+ai_semaphore = threading.Semaphore(AI_MAX_WORKERS)
+
+
+def _record_attempt_in_worker(
+    student_id: str,
+    skill_id: str,
+    is_correct: bool,
+    idempotency_key: str | None = None,
+) -> AttemptResult:
+    """Run record_attempt in a dedicated thread with its own connection lifecycle."""
+    conn = get_connection()
+    try:
+        return record_attempt(
+            conn=conn,
+            student_id=student_id,
+            skill_id=skill_id,
+            is_correct=is_correct,
+            idempotency_key=idempotency_key,
+        )
+    finally:
+        conn.close()
+
+
+def _run_ai_feedback_worker(skill_id: str, is_correct: bool) -> str:
+    """Invoke get_ai_feedback on worker thread and release capacity slot upon completion."""
+    try:
+        return get_ai_feedback(skill_id, is_correct)
+    finally:
+        ai_semaphore.release()
+
+
+async def fetch_ai_feedback(skill_id: str, is_correct: bool) -> tuple[str | None, str]:
+    """Fetch AI feedback using bounded worker pool and strict timeout.
+
+    Returns (feedback, feedback_status).
+    If worker slots are exhausted, immediately returns (None, 'unavailable') without queuing.
+    If timeout expires or provider fails, returns (None, 'unavailable').
+    The worker capacity remains occupied until the underlying thread finishes.
+    """
+    if not ai_semaphore.acquire(blocking=False):
+        return None, "unavailable"
+
+    loop = asyncio.get_running_loop()
+    try:
+        try:
+            future = loop.run_in_executor(
+                ai_executor,
+                _run_ai_feedback_worker,
+                skill_id,
+                is_correct,
+            )
+        except Exception:
+            ai_semaphore.release()
+            return None, "unavailable"
+
+        async with asyncio.timeout(AI_TIMEOUT_SECONDS):
+            feedback = await future
+            return feedback, "ok"
+    except Exception:
+        return None, "unavailable"
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
     yield
+    ai_executor.shutdown(wait=False)
 
 
 app = FastAPI(title="GenEd Mastery Service — Take-Home", lifespan=lifespan)
@@ -74,36 +144,27 @@ async def submit_attempt(
     attempt: AttemptRequest,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     identity: dict = Depends(get_current_identity),
-    conn: sqlite3.Connection = Depends(get_db),
 ) -> AttemptResponse:
     require_submit_access(identity, student_id)
 
-    result = record_attempt(
-        conn=conn,
+    result = await asyncio.to_thread(
+        _record_attempt_in_worker,
         student_id=student_id,
         skill_id=attempt.skill_id,
         is_correct=attempt.is_correct,
         idempotency_key=idempotency_key,
     )
 
-    # AI feedback is best-effort enrichment, called only after the domain
-    # transaction has committed so that AI latency/failure never blocks or
-    # rolls back the authoritative state change. Replays do not re-call AI feedback.
     feedback = None
     feedback_status = "unavailable"
     if not result.is_replayed:
-        try:
-            async with asyncio.timeout(AI_TIMEOUT_SECONDS):
-                feedback = await asyncio.to_thread(
-                    get_ai_feedback, attempt.skill_id, attempt.is_correct,
-                )
-            feedback_status = "ok"
-        except Exception:
-            pass
+        feedback, feedback_status = await fetch_ai_feedback(
+            attempt.skill_id, attempt.is_correct
+        )
 
     return AttemptResponse(
         skill_id=result.skill_id,
-        mastery=result.mastery,
+        mastery=round(result.mastery, 2),
         milestone_reached=result.milestone_reached,
         feedback=feedback,
         feedback_status=feedback_status,
@@ -137,7 +198,7 @@ def get_student_mastery(
         else:
             current_score = BASELINE_SEED
 
-        mastery_items.append(MasteryItem(skill_id=skill_id, mastery=current_score))
+        mastery_items.append(MasteryItem(skill_id=skill_id, mastery=round(current_score, 2)))
 
     return MasteryResponse(student_id=student_id, mastery=mastery_items)
 

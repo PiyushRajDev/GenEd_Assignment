@@ -21,6 +21,8 @@ decayed_score = stored_score × decay_factor
 
 `HALF_LIFE_DAYS = 30`, so after 30 days of inactivity, a score of 80 becomes 40. For a student's very first attempt on a skill, there is no stored score, so we seed from `BASELINE_SEED = 50.0` (no decay applied on cold start since there's no prior timestamp).
 
+**Precision and representation:** The database persists the authoritative score checkpoint `(score, last_practiced_at)` as an exact, unrounded floating-point number so subsequent decay and EWMA updates do not compound quantization errors. However, both `GET /students/{id}/mastery` and `POST /students/{id}/attempts` round the returned score to **2 decimal places** (`round(score, 2)`). Because continuous time-based decay produces microsecond-level decimal drift (e.g. `80.00` decaying to `79.9987...` over 60 seconds with zero student attempts), rounding avoids exposing floating-point noise or creating an impression of arbitrary score jitter on teacher dashboards while preserving exact math under the hood.
+
 **Why this approach:** EWMA is simple, deterministic, and gives recent attempts more weight than older ones without needing to store or replay the full attempt history. The mastery table only holds `(score, last_practiced_at)`. The half-life decay models the real phenomenon that skills fade without practice, and decaying toward 0 (not toward 50) means a student who stops practicing will eventually show near-zero mastery rather than settling at an ambiguous midpoint.
 
 **What it gets wrong / what a better version would fix:**
@@ -34,17 +36,21 @@ decayed_score = stored_score × decay_factor
 
 The `/attempts` endpoint treats AI feedback as **best-effort enrichment** that is strictly decoupled from the core domain transaction. The sequence:
 
-1. The domain transaction (`record_attempt`) runs first — attempt insertion, mastery update, and milestone notification all happen inside a single `BEGIN IMMEDIATE ... COMMIT` SQLite transaction.
-2. Only *after* that transaction commits does the endpoint call `get_ai_feedback`, wrapped in `asyncio.to_thread` with a 6-second `asyncio.timeout`.
-3. If the AI call succeeds within 6 seconds → `feedback` contains the string, `feedback_status = "ok"`.
-4. If the AI call raises `AIFeedbackError`, any other exception, or exceeds the timeout → the `except Exception` block catches it, and the response returns `feedback = null`, `feedback_status = "unavailable"`. No retry is attempted.
+1. The domain transaction (`_record_attempt_in_worker`) runs first off the asyncio event loop via `asyncio.to_thread` — connection creation, rate-limit check, attempt insertion, mastery update, milestone notification, and commit all happen inside an isolated worker thread.
+2. Only *after* that transaction commits does the endpoint invoke `fetch_ai_feedback`.
+3. Concurrency is bounded by a **dedicated 16-worker `ThreadPoolExecutor`** guarded by a non-blocking semaphore (`ai_semaphore.acquire(blocking=False)`):
+   - **Immediate degradation on saturation:** If all 16 AI worker slots are occupied, the endpoint does *not* queue work in an unbounded executor queue. It immediately degrades and returns `feedback = null`, `feedback_status = "unavailable"`, shielding the HTTP response from queue delay.
+   - **Strict 6-second timeout:** If an AI slot is acquired, the call is awaited under `asyncio.timeout(6)`.
+   - **Orphaned thread slot retention:** Python cannot forcibly terminate an OS thread mid-sleep or mid-network I/O. When the 6-second timeout fires, the HTTP endpoint returns `feedback_status = "unavailable"` immediately to the client, but the worker slot remains reserved until the underlying thread finishes (slot release is deferred to the thread's `finally:` block). This prevents timed-out threads from silently oversubscribing capacity.
+4. If the AI call succeeds within 6 seconds → `feedback` contains the string, `feedback_status = "ok"`.
+5. If the AI call raises `AIFeedbackError`, any other exception, or exceeds the timeout → the exception is caught, and the response returns `feedback = null`, `feedback_status = "unavailable"`. No retry is attempted. Replayed idempotent attempts bypass AI feedback entirely.
 
 **What a student actually sees:**
 
-- **When `get_ai_feedback` is slow (but under 6s):** The HTTP response is delayed by however long the AI takes (0.5–5s), but the student gets their mastery score, milestone status, *and* feedback. The score is already committed, so even if the student's browser times out, their attempt is safe.
-- **When `get_ai_feedback` is slow (over 6s) or raises `AIFeedbackError`:** The student gets a 200 response with their correct mastery score and milestone status, but `feedback` is `null` and `feedback_status` is `"unavailable"`. The student sees something like "Feedback is temporarily unavailable." Their attempt is fully recorded and their score is accurate; they just don't get the AI hint this time.
+- **When `get_ai_feedback` is slow (but under 6s) and capacity is available:** The HTTP response is delayed by however long the AI takes (0.5–5s), but the student gets their mastery score, milestone status, *and* feedback. The score is already committed, so even if the student's browser times out, their attempt is safe.
+- **When `get_ai_feedback` is slow (over 6s), raises an error, or AI capacity is saturated:** The student gets a 200 response with their correct mastery score and milestone status, but `feedback` is `null` and `feedback_status` is `"unavailable"`. The student sees something like "Feedback is temporarily unavailable." Their attempt is fully recorded and their score is accurate; they just don't get the AI hint this time.
 
-AI failure never rolls back or blocks the authoritative state change. The student's attempt, score, and milestone stay durable no matter what the AI does.
+AI failure or saturation never rolls back or blocks the authoritative state change. The student's attempt, score, and milestone stay durable no matter what the AI does.
 
 ## 3. The crash-durability requirement
 
@@ -66,6 +72,8 @@ BEGIN IMMEDIATE
 COMMIT
 ```
 
+**Off-loop thread architecture:** In `submit_attempt` (`async def`), the entire database transaction runs in a worker thread via `asyncio.to_thread(_record_attempt_in_worker)`. A dedicated SQLite connection is created, used, and closed within the same worker thread. This keeps the transaction strictly isolated and prevents blocking operations (such as waiting on `PRAGMA busy_timeout=5000` during lock contention) from stalling the asyncio event loop or delaying concurrent HTTP requests (e.g. `/health`).
+
 If the process crashes at any point *before* `COMMIT`, SQLite's WAL journal guarantees that on recovery, all writes are rolled back atomically. The student's attempt, mastery update, notification, and idempotency record are **all-or-nothing**. You never get a mastery update to 82 without the corresponding notification row, and you never get a notification without the attempt being recorded.
 
 If the process crashes *after* `COMMIT` but before the HTTP response reaches the client, the data is durable on disk (SQLite `PRAGMA synchronous=NORMAL` with WAL mode ensures the commit is fsynced). Because client retries can send an `Idempotency-Key` header:
@@ -77,6 +85,7 @@ If the process crashes *after* `COMMIT` but before the HTTP response reaches the
 
 - `PRAGMA synchronous=NORMAL` (not `FULL`) means there's a tiny window where a power failure (not just a process crash) could lose committed data in WAL mode. For a production system with real stakes, I'd use `synchronous=FULL` and accept the write latency, or switch to Postgres.
 - The AI feedback call happens *after* the commit, so if the process crashes right after commit but before returning the response, the student never gets feedback for that attempt. There's no retry queue, so that feedback is lost for good. This is acceptable because feedback is explicitly best-effort, but a production system might want an async feedback pipeline.
+- SQLite write concurrency is fundamentally serialized at the file lock level. While offloading to worker threads protects event loop liveness, high write volume will still queue on the single writer lock, which Postgres row-level locking would solve.
 
 ## 4. Rate limiting
 
@@ -104,7 +113,7 @@ The rate limit is **per-student, cross-skill**. It counts all attempts by a stud
 
 In priority order:
 
-1. **Async feedback pipeline with retries.** Replace the synchronous-after-commit AI call with a background task queue (e.g. an `asyncio.Queue` or a lightweight job table in SQLite). Store a `feedback_request_id` on the attempt, poll/push results, and let the client fetch feedback separately via `GET /attempts/{id}/feedback`. This would decouple response latency from AI latency entirely.
+1. **Async feedback pipeline with retries.** While AI concurrency is now bounded to 16 workers with immediate degradation, feedback is still synchronous-after-commit. Replace this with a background task queue (e.g. an `asyncio.Queue` or a lightweight job table in SQLite). Store a `feedback_request_id` on the attempt, poll/push results, and let the client fetch feedback separately via `GET /attempts/{id}/feedback`. This would decouple response latency from AI latency entirely.
 
 2. **Observability.** Add structured logging (request IDs, latency metrics, AI success/failure rates), a health-check endpoint with database connectivity status, and basic Prometheus-style metrics for rate-limit hits, milestone events, and P95 response times.
 
